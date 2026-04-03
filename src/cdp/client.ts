@@ -9,6 +9,10 @@ export class CDPClient {
   // 支持 once 选项的监听器结构
   private eventListeners: Map<string, Array<{ callback: (data: any) => void; once: boolean }>> = new Map();
   private connected: boolean = false;
+  
+  // 心跳相关
+  private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private readonly PING_INTERVAL_MS = 30000; // 30 秒
 
   constructor(url: string) {
     this.url = url;
@@ -25,6 +29,7 @@ export class CDPClient {
 
       this.ws.onclose = () => {
         this.connected = false;
+        this.stopPing();
         // 拒绝所有待处理的请求
         for (const [id, { reject: rej }] of this.pendingRequests) {
           rej(new Error('WebSocket closed'));
@@ -48,6 +53,8 @@ export class CDPClient {
     for (let i = 0; i < maxRetries; i++) {
       try {
         await this.connect();
+        // 连接成功后启动心跳
+        this.startPing();
         return;
       } catch (err: any) {
         lastError = err;
@@ -59,6 +66,30 @@ export class CDPClient {
       }
     }
     throw lastError || new Error('CDP connection failed after retries');
+  }
+
+  // 启动心跳
+  private startPing(): void {
+    this.stopPing();
+    this.pingInterval = setInterval(async () => {
+      if (this.connected) {
+        try {
+          // 发送轻量级命令作为心跳
+          await this.send('Runtime.evaluate', { expression: '1' });
+        } catch (err) {
+          console.warn('CDP ping failed, marking as disconnected');
+          this.connected = false;
+        }
+      }
+    }, this.PING_INTERVAL_MS);
+  }
+
+  // 停止心跳
+  private stopPing(): void {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
   }
 
   private handleMessage(data: string): void {
@@ -148,13 +179,14 @@ export class CDPClient {
   }
 
   close(): void {
+    this.stopPing();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
-      this.connected = false;
-      this.pendingRequests.clear();
-      this.eventListeners.clear();
     }
+    this.connected = false;
+    this.pendingRequests.clear();
+    this.eventListeners.clear();
   }
 
   isConnected(): boolean {

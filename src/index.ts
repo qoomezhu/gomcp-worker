@@ -9,8 +9,10 @@ export interface Env {
   CDP_URL: string;
   // 补丁 2：会话空闲超时配置 (毫秒)
   SESSION_IDLE_TIMEOUT_MS?: string;
-  // 补丁 1 (预留)：API Key
+  // 补丁 1：API Key 鉴权
   API_KEY?: string;
+  // 动态 CORS 配置
+  ALLOWED_ORIGINS?: string;
 }
 
 // 主 Worker 入口
@@ -21,56 +23,91 @@ export default {
     ctx: ExecutionContext
   ): Promise<Response> {
     const url = new URL(request.url);
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Mcp-Session-Id',
-    };
 
     // 处理 CORS 预检请求
     if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
+      return new Response(null, { headers: getCorsHeaders(request, env) });
     }
 
     // Streamable HTTP endpoint (MCP 2025-03-26)
     if (url.pathname === '/mcp') {
+      // 【补丁 1】API Key 鉴权
+      if (!verifyAuth(request, env)) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 401,
+          headers: { ...getCorsHeaders(request, env), 'Content-Type': 'application/json' },
+        });
+      }
+
       const sessionId = request.headers.get('Mcp-Session-Id');
 
       switch (request.method) {
         case 'GET':
-          return handleSSE(request, env, sessionId, corsHeaders);
+          return handleSSE(request, env, sessionId, getCorsHeaders(request, env));
         case 'POST':
-          return handleJSONRPC(request, env, sessionId, corsHeaders);
+          return handleJSONRPC(request, env, sessionId, getCorsHeaders(request, env));
         case 'DELETE':
-          return handleDeleteSession(env, sessionId, corsHeaders);
+          return handleDeleteSession(env, sessionId, getCorsHeaders(request, env));
         default:
           return new Response('Method Not Allowed', {
             status: 405,
-            headers: corsHeaders,
+            headers: getCorsHeaders(request, env),
           });
       }
     }
 
     // 兼容旧版 SSE endpoint
     if (url.pathname === '/sse') {
+      if (!verifyAuth(request, env)) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 401,
+          headers: { ...getCorsHeaders(request, env), 'Content-Type': 'application/json' },
+        });
+      }
       if (request.method === 'GET') {
-        return handleSSE(request, env, null, corsHeaders);
+        return handleSSE(request, env, null, getCorsHeaders(request, env));
       }
     }
 
-    // 健康检查
+    // 健康检查 (无需鉴权)
     if (url.pathname === '/health') {
-      return new Response(JSON.stringify({ status: 'ok' }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      return new Response(JSON.stringify({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        version: '1.0.0',
+      }), {
+        headers: { ...getCorsHeaders(request, env), 'Content-Type': 'application/json' },
       });
     }
 
     return new Response('Not Found', {
       status: 404,
-      headers: corsHeaders,
+      headers: getCorsHeaders(request, env),
     });
   },
 };
+
+// 【补丁 1】API Key 鉴权
+function verifyAuth(request: Request, env: Env): boolean {
+  // 如果未设置 API_KEY，则跳过鉴权（开发环境）
+  if (!env.API_KEY) return true;
+
+  const apiKey = request.headers.get('X-Api-Key');
+  return apiKey === env.API_KEY;
+}
+
+// 【补丁 1】动态 CORS 配置
+function getCorsHeaders(request: Request, env: Env): Record<string, string> {
+  const origin = request.headers.get('Origin');
+  const allowedOrigins = (env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim());
+  const isAllowed = allowedOrigins.includes('*') || allowedOrigins.includes(origin || '');
+
+  return {
+    'Access-Control-Allow-Origin': isAllowed ? (origin || '*') : '',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Mcp-Session-Id, X-Api-Key',
+  };
+}
 
 // 处理 SSE 连接
 async function handleSSE(

@@ -8,11 +8,13 @@ Cloudflare Workers 实现的 gomcp (MCP Server for Lightpanda Browser)。
 - ✅ Streamable HTTP 传输
 - ✅ SSE 传输
 - ✅ Durable Objects 状态管理
-- ✅ CDP WebSocket 客户端 (自动重连/心跳)
+- ✅ CDP WebSocket 客户端 (自动重连/心跳保活)
 - ✅ 全球 Edge 部署
 - ✅ Turndown HTML → Markdown 转换
 - ✅ 会话空闲自动清理
 - ✅ 请求取消支持
+- ✅ API Key 鉴权
+- ✅ 动态 CORS 配置
 
 ## 可用工具
 
@@ -37,6 +39,10 @@ npm install
 # 设置 Lightpanda 浏览器的 CDP WebSocket URL
 wrangler secret set CDP_URL
 # 输入: wss://your-lightpanda-instance:9222
+
+# (可选) 设置 API Key 进行鉴权
+wrangler secret set API_KEY
+# 输入: your-secret-key
 ```
 
 ### 3. 本地开发
@@ -56,6 +62,8 @@ npm run deploy
 | 变量 | 描述 | 默认值 |
 |------|------|--------|
 | `CDP_URL` | Lightpanda 浏览器 CDP WebSocket URL | 无 (必填) |
+| `API_KEY` | API 鉴权密钥 (通过 `wrangler secret set` 设置) | 无 (跳过鉴权) |
+| `ALLOWED_ORIGINS` | 允许的 CORS 来源，逗号分隔 | `*` |
 | `SESSION_IDLE_TIMEOUT_MS` | 会话空闲超时时间 (毫秒) | 600000 (10 分钟) |
 | `CDP_COMMAND_TIMEOUT_MS` | CDP 命令超时时间 (毫秒) | 30000 (30 秒) |
 | `MAX_HTML_LENGTH` | 页面内容最大长度 (字节) | 500000 (500KB) |
@@ -68,7 +76,10 @@ npm run deploy
 {
   "mcpServers": {
     "lightpanda": {
-      "url": "https://your-worker.workers.dev/mcp"
+      "url": "https://your-worker.workers.dev/mcp",
+      "headers": {
+        "X-Api-Key": "your-secret-key"
+      }
     }
   }
 }
@@ -80,11 +91,13 @@ npm run deploy
 # 初始化
 curl -X POST https://your-worker.workers.dev/mcp \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: your-secret-key" \
   -d '{"jsonrpc":"2.0","method":"initialize","params":{},"id":1}'
 
 # 列出工具
 curl -X POST https://your-worker.workers.dev/mcp \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: your-secret-key" \
   -H "Mcp-Session-Id: your-session-id" \
   -d '{"jsonrpc":"2.0","method":"tools/list","params":{},"id":2}'
 ```
@@ -93,9 +106,9 @@ curl -X POST https://your-worker.workers.dev/mcp \
 
 ```
 MCP Client
-    ↓ (HTTP/SSE)
+    ↓ (HTTP/SSE + API Key)
 Cloudflare Workers (Edge)
-    ↓ (WebSocket)
+    ↓ (WebSocket + 心跳保活)
 Lightpanda Browser (CDP)
 ```
 
@@ -105,6 +118,7 @@ Lightpanda Browser (CDP)
 - 每个会话有独立的 CDP WebSocket 连接
 - 页面状态在会话间持久化
 - 空闲会话自动清理，节省资源
+- WebSocket 心跳保活，防止连接断开
 
 ## 免费额度
 

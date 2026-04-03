@@ -12,7 +12,11 @@ class_name = "MCPSession"
 # CDP WebSocket URL (通过 wrangler secret set CDP_URL 设置)
 # CDP_URL = "wss://your-lightpanda-instance:9222"
 
-# 配置参数
+# 安全配置
+# API_KEY = "your-secret-key"  # 通过 wrangler secret set API_KEY 设置
+ALLOWED_ORIGINS = "*"  # 允许的 CORS 来源，逗号分隔
+
+# 性能配置
 SESSION_IDLE_TIMEOUT_MS = "600000"  # 10 分钟
 CDP_COMMAND_TIMEOUT_MS = "30000"    # 30 秒
 MAX_HTML_LENGTH = "500000"          # 500KB
