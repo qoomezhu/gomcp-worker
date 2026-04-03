@@ -1,0 +1,19 @@
+name = "gomcp-worker"
+main = "src/index.ts"
+compatibility_date = "2025-01-21"
+
+# Durable Object 绑定 - 用于 MCP Session 状态管理
+[[durable_objects.bindings]]
+name = "MCP_SESSION"
+class_name = "MCPSession"
+
+# 环境变量
+[vars]
+# CDP WebSocket URL (通过 wrangler secret set CDP_URL 设置)
+# CDP_URL = "wss://your-lightpanda-instance:9222"
+
+# 生产环境配置
+[env.production]
+[[env.production.durable_objects.bindings]]
+name = "MCP_SESSION"
+class_name = "MCPSession"
