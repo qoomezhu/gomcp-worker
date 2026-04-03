@@ -41,6 +41,11 @@ export class MCPSession extends DurableObject {
     loaded: false,
   };
 
+  // 补丁 2 & 3 相关属性
+  private lastAccessed: number = Date.now();
+  private cancelledRequests: Set<string | number> = new Set();
+  private readonly DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 默认 10 分钟
+
   // 初始化 SSE 连接
   async initSSE(
     writer: WritableStreamDefaultWriter<string>,
@@ -48,6 +53,7 @@ export class MCPSession extends DurableObject {
   ): Promise<void> {
     this.sseWriter = writer;
     this.cdpUrl = cdpUrl;
+    this.lastAccessed = Date.now(); // 重置活跃时间
 
     // 发送连接确认事件
     await this.sendSSE({
@@ -60,9 +66,45 @@ export class MCPSession extends DurableObject {
   // 处理 JSON-RPC 请求
   async handleRequest(
     request: MCPRequest,
-    cdpUrl: string
+    cdpUrl: string,
+    env?: Env
   ): Promise<MCPResponse> {
     this.cdpUrl = cdpUrl;
+    const now = Date.now();
+
+    // 获取超时配置
+    const timeoutMs = env?.SESSION_IDLE_TIMEOUT_MS
+      ? parseInt(env.SESSION_IDLE_TIMEOUT_MS)
+      : this.DEFAULT_IDLE_TIMEOUT_MS;
+
+    // 【补丁 2】检查空闲超时
+    // 如果距离上次活跃时间超过阈值，且不是初始化请求，则视为会话过期
+    // 注意：对于新唤醒的实例，lastAccessed 是 now，不会触发。
+    // 这主要用于检测长时间存活的实例（例如保持 SSE 连接但无交互）。
+    if (
+      request.method !== 'initialize' &&
+      now - this.lastAccessed > timeoutMs
+    ) {
+      await this.close(); // 清理资源
+      return {
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Session expired due to inactivity' },
+        id: request.id,
+      };
+    }
+
+    // 更新活跃时间
+    this.lastAccessed = now;
+
+    // 【补丁 3】处理取消通知
+    if (request.method === 'notifications/cancelled') {
+      const idToCancel = request.params?.id;
+      if (idToCancel !== undefined) {
+        this.cancelledRequests.add(idToCancel);
+        console.log(`Request ${idToCancel} marked as cancelled`);
+      }
+      return { jsonrpc: '2.0', result: null, id: null };
+    }
 
     // 确保 CDP 连接（包含重连逻辑）
     try {
@@ -157,12 +199,32 @@ export class MCPSession extends DurableObject {
       };
     }
 
+    // 【补丁 3】检查请求是否被取消
+    if (this.cancelledRequests.has(request.id)) {
+      this.cancelledRequests.delete(request.id);
+      return {
+        jsonrpc: '2.0',
+        error: { code: -32800, message: 'Request cancelled by client' },
+        id: request.id,
+      };
+    }
+
     try {
       const tool = TOOLS.find((t) => t.name === name);
       if (!tool) {
         return {
           jsonrpc: '2.0',
           error: { code: -32602, message: `Unknown tool: ${name}` },
+          id: request.id,
+        };
+      }
+
+      // 执行工具前再次检查（防止排队期间被取消）
+      if (this.cancelledRequests.has(request.id)) {
+        this.cancelledRequests.delete(request.id);
+        return {
+          jsonrpc: '2.0',
+          error: { code: -32800, message: 'Request cancelled by client' },
           id: request.id,
         };
       }
@@ -182,6 +244,16 @@ export class MCPSession extends DurableObject {
         id: request.id,
       };
     } catch (error: any) {
+      // 检查是否在工具执行期间被取消
+      if (this.cancelledRequests.has(request.id)) {
+        this.cancelledRequests.delete(request.id);
+        return {
+          jsonrpc: '2.0',
+          error: { code: -32800, message: 'Request cancelled' },
+          id: request.id,
+        };
+      }
+
       return {
         jsonrpc: '2.0',
         error: {
@@ -211,7 +283,7 @@ export class MCPSession extends DurableObject {
       try {
         // 使用带重试的连接方法
         await this.cdpClient.connectWithRetry(3);
-        
+
         // 启用必要的域
         await this.cdpClient.send('Page.enable', {});
         await this.cdpClient.send('Runtime.enable', {});
@@ -294,13 +366,13 @@ export class MCPSession extends DurableObject {
     });
 
     let html = cleanedHtml.result.value || '';
-    
+
     // 2. 限制最大长度 (例如 500KB)，防止 Turndown 处理超时
-    const MAX_LENGTH = 500000; 
+    const MAX_LENGTH = 500000;
     if (html.length > MAX_LENGTH) {
       html = html.substring(0, MAX_LENGTH) + '\n\n... [Content Truncated due to length limit]';
     }
-    
+
     return html;
   }
 
@@ -322,7 +394,7 @@ export class MCPSession extends DurableObject {
   // 优化：错误处理 + 健壮的选择器
   public async searchDuckDuckGo(query: string): Promise<string> {
     const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    
+
     // 1. 尝试导航
     try {
       await this.navigateTo(searchUrl);
@@ -342,7 +414,7 @@ export class MCPSession extends DurableObject {
               url: titleEl?.href || '',
               snippet: snippetEl?.textContent?.trim() || ''
             };
-          }).filter(r => r.url && r.title); // 过滤掉没有链接或标题的无效结果
+          }).filter(r => r.url && r.title); // 过滤无效结果
         `,
       });
 

@@ -7,6 +7,10 @@ export { MCPSession };
 export interface Env {
   MCP_SESSION: DurableObjectNamespace;
   CDP_URL: string;
+  // 补丁 2：会话空闲超时配置 (毫秒)
+  SESSION_IDLE_TIMEOUT_MS?: string;
+  // 补丁 1 (预留)：API Key
+  API_KEY?: string;
 }
 
 // 主 Worker 入口
@@ -122,7 +126,8 @@ async function handleJSONRPC(
   const id = sessionId || crypto.randomUUID();
   const session = env.MCP_SESSION.get(env.MCP_SESSION.idFromName(id));
 
-  const response = await session.handleRequest(body, env.CDP_URL);
+  // 传递 env 以支持配置读取
+  const response = await session.handleRequest(body, env.CDP_URL, env);
 
   return new Response(JSON.stringify(response), {
     headers: {
