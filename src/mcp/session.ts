@@ -274,16 +274,34 @@ export class MCPSession extends DurableObject {
     }
   }
 
+  // 优化：浏览器端清理 + 截断
   public async getPageContent(): Promise<string> {
     if (!this.cdpClient) {
       throw new Error('CDP not connected');
     }
 
-    const result = await this.cdpClient.send('Runtime.evaluate', {
-      expression: 'document.documentElement.outerHTML',
+    // 1. 在浏览器端清理无用标签，减少传输体积
+    const cleanedHtml = await this.cdpClient.send('Runtime.evaluate', {
+      expression: `
+        (function() {
+          // 克隆 DOM 树以避免修改原页面
+          const clone = document.documentElement.cloneNode(true);
+          // 移除干扰元素
+          clone.querySelectorAll('script, style, noscript, iframe, svg, link, meta').forEach(el => el.remove());
+          return clone.outerHTML;
+        })()
+      `,
     });
 
-    return result.result.value || '';
+    let html = cleanedHtml.result.value || '';
+    
+    // 2. 限制最大长度 (例如 500KB)，防止 Turndown 处理超时
+    const MAX_LENGTH = 500000; 
+    if (html.length > MAX_LENGTH) {
+      html = html.substring(0, MAX_LENGTH) + '\n\n... [Content Truncated due to length limit]';
+    }
+    
+    return html;
   }
 
   public async getPageLinks(): Promise<string[]> {
@@ -301,19 +319,41 @@ export class MCPSession extends DurableObject {
     return result.result.value || [];
   }
 
+  // 优化：错误处理 + 健壮的选择器
   public async searchDuckDuckGo(query: string): Promise<string> {
     const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    await this.navigateTo(searchUrl);
+    
+    // 1. 尝试导航
+    try {
+      await this.navigateTo(searchUrl);
+    } catch (e: any) {
+      return `Search navigation failed: ${e.message}`;
+    }
 
-    const results = await this.cdpClient!.send('Runtime.evaluate', {
-      expression: `Array.from(document.querySelectorAll('.result')).map(r => ({
-        title: r.querySelector('.result__title')?.textContent?.trim() || '',
-        url: r.querySelector('.result__url')?.href || '',
-        snippet: r.querySelector('.result__snippet')?.textContent?.trim() || ''
-      }))`,
-    });
+    // 2. 更健壮的提取逻辑
+    try {
+      const results = await this.cdpClient!.send('Runtime.evaluate', {
+        expression: `
+          Array.from(document.querySelectorAll('.result')).map(r => {
+            const titleEl = r.querySelector('.result__title a');
+            const snippetEl = r.querySelector('.result__snippet');
+            return {
+              title: titleEl?.textContent?.trim() || '',
+              url: titleEl?.href || '',
+              snippet: snippetEl?.textContent?.trim() || ''
+            };
+          }).filter(r => r.url && r.title); // 过滤掉没有链接或标题的无效结果
+        `,
+      });
 
-    return JSON.stringify(results.result.value || [], null, 2);
+      const data = results.result.value || [];
+      if (data.length === 0) {
+        return "No search results found.";
+      }
+      return JSON.stringify(data, null, 2);
+    } catch (e: any) {
+      return `Failed to extract search results: ${e.message}`;
+    }
   }
 
   public getPageState() {
