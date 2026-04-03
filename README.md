@@ -10,6 +10,7 @@ Cloudflare Workers 实现的 gomcp (MCP Server for Lightpanda Browser)。
 - ✅ Durable Objects 状态管理
 - ✅ CDP WebSocket 客户端
 - ✅ 全球 Edge 部署
+- ✅ Turndown HTML → Markdown 转换
 
 ## 可用工具
 
@@ -92,6 +93,18 @@ Lightpanda Browser (CDP)
 - 使用 **Durable Objects** 管理 MCP Session 状态
 - 每个会话有独立的 CDP WebSocket 连接
 - 页面状态在会话间持久化
+
+## 免费额度
+
+### Durable Objects (Workers Free Plan)
+
+| 资源 | 每日免费额度 |
+|------|-------------|
+| 请求数 | 100,000 次/天 |
+| 计算量 | 13,000 GB-s/天 |
+| SQLite 行读取 | 5,000,000 次/天 |
+| SQLite 行写入 | 100,000 次/天 |
+| 总存储 | 5 GB |
 
 ## 环境变量
 

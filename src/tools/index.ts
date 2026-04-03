@@ -1,5 +1,22 @@
 import { MCPTool } from '../types/mcp';
 
+// 动态导入 Turndown（Workers 环境兼容）
+let TurndownService: any;
+let turndownPluginGfm: any;
+
+async function getTurndownInstance() {
+  if (!TurndownService) {
+    const turndownModule = await import('turndown');
+    TurndownService = turndownModule.default || turndownModule;
+  }
+  return new TurndownService({
+    headingStyle: 'atx',
+    codeBlockStyle: 'fenced',
+    bulletListMarker: '-',
+    emDelimiter: '*',
+  });
+}
+
 // goto 工具 - 导航到指定 URL
 export const GotoTool: MCPTool = {
   name: 'goto',
@@ -61,10 +78,8 @@ export const MarkdownTool: MCPTool = {
   },
   execute: async (args, session) => {
     const html = await session.getPageContent();
-
-    // 简化版 HTML 转 Markdown
-    // 实际项目中可以使用 turndown 等库
-    return htmlToMarkdown(html);
+    const turndown = await getTurndownInstance();
+    return turndown.turndown(html);
   },
 };
 
@@ -81,21 +96,3 @@ export const LinksTool: MCPTool = {
     return JSON.stringify(links, null, 2);
   },
 };
-
-// 简易 HTML 转 Markdown 函数
-function htmlToMarkdown(html: string): string {
-  // 移除 script 和 style 标签
-  let text = html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  // 限制输出长度
-  if (text.length > 10000) {
-    text = text.substring(0, 10000) + '\n...[truncated]';
-  }
-
-  return text;
-}
