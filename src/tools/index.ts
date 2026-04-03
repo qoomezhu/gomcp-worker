@@ -2,7 +2,6 @@ import { MCPTool } from '../types/mcp';
 
 // 动态导入 Turndown（Workers 环境兼容）
 let TurndownService: any;
-let turndownPluginGfm: any;
 
 async function getTurndownInstance() {
   if (!TurndownService) {
@@ -37,9 +36,7 @@ export const GotoTool: MCPTool = {
       throw new Error('Missing required parameter: url');
     }
 
-    // 传递 env (如果 session 支持)
-    const env = (session as any).env;
-    await session.navigateTo(url, env);
+    await session.navigateTo(url);
     const state = session.getPageState();
 
     return `Navigated to ${url}\nTitle: ${state.title || 'Unknown'}`;
@@ -66,8 +63,7 @@ export const SearchTool: MCPTool = {
       throw new Error('Missing required parameter: text');
     }
 
-    const env = (session as any).env;
-    return await session.searchDuckDuckGo(query, env);
+    return await session.searchDuckDuckGo(query);
   },
 };
 
@@ -80,8 +76,7 @@ export const MarkdownTool: MCPTool = {
     properties: {},
   },
   execute: async (args, session) => {
-    const env = (session as any).env;
-    const html = await session.getPageContent(env);
+    const html = await session.getPageContent();
     const turndown = await getTurndownInstance();
     return turndown.turndown(html);
   },

@@ -45,7 +45,7 @@ export class MCPSession extends DurableObject {
   private lastAccessed: number = Date.now();
   private cancelledRequests: Set<string | number> = new Set();
 
-  // 默认配置
+  // 默认配置 (硬编码)
   private readonly DEFAULTS = {
     IDLE_TIMEOUT_MS: 10 * 60 * 1000, // 10 分钟
     COMMAND_TIMEOUT_MS: 30000,       // 30 秒
@@ -72,21 +72,15 @@ export class MCPSession extends DurableObject {
   // 处理 JSON-RPC 请求
   async handleRequest(
     request: MCPRequest,
-    cdpUrl: string,
-    env?: Env
+    cdpUrl: string
   ): Promise<MCPResponse> {
     this.cdpUrl = cdpUrl;
     const now = Date.now();
 
-    // 获取超时配置
-    const idleTimeout = env?.SESSION_IDLE_TIMEOUT_MS
-      ? parseInt(env.SESSION_IDLE_TIMEOUT_MS)
-      : this.DEFAULTS.IDLE_TIMEOUT_MS;
-
-    // 【补丁 2】检查空闲超时
+    // 【补丁 2】检查空闲超时 (使用硬编码默认值)
     if (
       request.method !== 'initialize' &&
-      now - this.lastAccessed > idleTimeout
+      now - this.lastAccessed > this.DEFAULTS.IDLE_TIMEOUT_MS
     ) {
       await this.close(); // 清理资源
       return {
@@ -315,17 +309,15 @@ export class MCPSession extends DurableObject {
   }
 
   // 公开方法供工具使用
-  public async navigateTo(url: string, env?: Env): Promise<void> {
+  public async navigateTo(url: string): Promise<void> {
     if (!this.cdpClient) {
       throw new Error('CDP not connected');
     }
 
     await this.cdpClient.send('Page.navigate', { url });
 
-    // 获取超时配置
-    const timeoutMs = env?.CDP_COMMAND_TIMEOUT_MS
-      ? parseInt(env.CDP_COMMAND_TIMEOUT_MS)
-      : this.DEFAULTS.COMMAND_TIMEOUT_MS;
+    // 使用硬编码超时
+    const timeoutMs = this.DEFAULTS.COMMAND_TIMEOUT_MS;
 
     // 使用 once 监听器防止泄漏
     await new Promise<void>((resolve, reject) => {
@@ -354,8 +346,8 @@ export class MCPSession extends DurableObject {
     }
   }
 
-  // 优化：浏览器端清理 + 截断
-  public async getPageContent(env?: Env): Promise<string> {
+  // 优化：浏览器端清理 + 截断 (使用硬编码长度)
+  public async getPageContent(): Promise<string> {
     if (!this.cdpClient) {
       throw new Error('CDP not connected');
     }
@@ -375,10 +367,8 @@ export class MCPSession extends DurableObject {
 
     let html = cleanedHtml.result.value || '';
 
-    // 2. 限制最大长度，防止 Turndown 处理超时
-    const maxLength = env?.MAX_HTML_LENGTH
-      ? parseInt(env.MAX_HTML_LENGTH)
-      : this.DEFAULTS.MAX_HTML_LENGTH;
+    // 2. 限制最大长度
+    const maxLength = this.DEFAULTS.MAX_HTML_LENGTH;
 
     if (html.length > maxLength) {
       html = html.substring(0, maxLength) + '\n\n... [Content Truncated due to length limit]';
@@ -403,12 +393,12 @@ export class MCPSession extends DurableObject {
   }
 
   // 优化：错误处理 + 健壮的选择器
-  public async searchDuckDuckGo(query: string, env?: Env): Promise<string> {
+  public async searchDuckDuckGo(query: string): Promise<string> {
     const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 
     // 1. 尝试导航
     try {
-      await this.navigateTo(searchUrl, env);
+      await this.navigateTo(searchUrl);
     } catch (e: any) {
       return `Search navigation failed: ${e.message}`;
     }
