@@ -37,7 +37,9 @@ export const GotoTool: MCPTool = {
       throw new Error('Missing required parameter: url');
     }
 
-    await session.navigateTo(url);
+    // 传递 env (如果 session 支持)
+    const env = (session as any).env;
+    await session.navigateTo(url, env);
     const state = session.getPageState();
 
     return `Navigated to ${url}\nTitle: ${state.title || 'Unknown'}`;
@@ -64,7 +66,8 @@ export const SearchTool: MCPTool = {
       throw new Error('Missing required parameter: text');
     }
 
-    return await session.searchDuckDuckGo(query);
+    const env = (session as any).env;
+    return await session.searchDuckDuckGo(query, env);
   },
 };
 
@@ -77,7 +80,8 @@ export const MarkdownTool: MCPTool = {
     properties: {},
   },
   execute: async (args, session) => {
-    const html = await session.getPageContent();
+    const env = (session as any).env;
+    const html = await session.getPageContent(env);
     const turndown = await getTurndownInstance();
     return turndown.turndown(html);
   },

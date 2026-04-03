@@ -44,7 +44,13 @@ export class MCPSession extends DurableObject {
   // 补丁 2 & 3 相关属性
   private lastAccessed: number = Date.now();
   private cancelledRequests: Set<string | number> = new Set();
-  private readonly DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 默认 10 分钟
+
+  // 默认配置
+  private readonly DEFAULTS = {
+    IDLE_TIMEOUT_MS: 10 * 60 * 1000, // 10 分钟
+    COMMAND_TIMEOUT_MS: 30000,       // 30 秒
+    MAX_HTML_LENGTH: 500000,         // 500KB
+  };
 
   // 初始化 SSE 连接
   async initSSE(
@@ -73,17 +79,14 @@ export class MCPSession extends DurableObject {
     const now = Date.now();
 
     // 获取超时配置
-    const timeoutMs = env?.SESSION_IDLE_TIMEOUT_MS
+    const idleTimeout = env?.SESSION_IDLE_TIMEOUT_MS
       ? parseInt(env.SESSION_IDLE_TIMEOUT_MS)
-      : this.DEFAULT_IDLE_TIMEOUT_MS;
+      : this.DEFAULTS.IDLE_TIMEOUT_MS;
 
     // 【补丁 2】检查空闲超时
-    // 如果距离上次活跃时间超过阈值，且不是初始化请求，则视为会话过期
-    // 注意：对于新唤醒的实例，lastAccessed 是 now，不会触发。
-    // 这主要用于检测长时间存活的实例（例如保持 SSE 连接但无交互）。
     if (
       request.method !== 'initialize' &&
-      now - this.lastAccessed > timeoutMs
+      now - this.lastAccessed > idleTimeout
     ) {
       await this.close(); // 清理资源
       return {
@@ -219,7 +222,7 @@ export class MCPSession extends DurableObject {
         };
       }
 
-      // 执行工具前再次检查（防止排队期间被取消）
+      // 执行工具前再次检查
       if (this.cancelledRequests.has(request.id)) {
         this.cancelledRequests.delete(request.id);
         return {
@@ -312,18 +315,23 @@ export class MCPSession extends DurableObject {
   }
 
   // 公开方法供工具使用
-  public async navigateTo(url: string): Promise<void> {
+  public async navigateTo(url: string, env?: Env): Promise<void> {
     if (!this.cdpClient) {
       throw new Error('CDP not connected');
     }
 
     await this.cdpClient.send('Page.navigate', { url });
 
+    // 获取超时配置
+    const timeoutMs = env?.CDP_COMMAND_TIMEOUT_MS
+      ? parseInt(env.CDP_COMMAND_TIMEOUT_MS)
+      : this.DEFAULTS.COMMAND_TIMEOUT_MS;
+
     // 使用 once 监听器防止泄漏
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
         reject(new Error('Page load timeout'));
-      }, 30000);
+      }, timeoutMs);
 
       // 使用 once: true 确保监听器在触发后自动移除
       this.cdpClient!.on('Page.loadEventFired', () => {
@@ -347,7 +355,7 @@ export class MCPSession extends DurableObject {
   }
 
   // 优化：浏览器端清理 + 截断
-  public async getPageContent(): Promise<string> {
+  public async getPageContent(env?: Env): Promise<string> {
     if (!this.cdpClient) {
       throw new Error('CDP not connected');
     }
@@ -367,10 +375,13 @@ export class MCPSession extends DurableObject {
 
     let html = cleanedHtml.result.value || '';
 
-    // 2. 限制最大长度 (例如 500KB)，防止 Turndown 处理超时
-    const MAX_LENGTH = 500000;
-    if (html.length > MAX_LENGTH) {
-      html = html.substring(0, MAX_LENGTH) + '\n\n... [Content Truncated due to length limit]';
+    // 2. 限制最大长度，防止 Turndown 处理超时
+    const maxLength = env?.MAX_HTML_LENGTH
+      ? parseInt(env.MAX_HTML_LENGTH)
+      : this.DEFAULTS.MAX_HTML_LENGTH;
+
+    if (html.length > maxLength) {
+      html = html.substring(0, maxLength) + '\n\n... [Content Truncated due to length limit]';
     }
 
     return html;
@@ -392,12 +403,12 @@ export class MCPSession extends DurableObject {
   }
 
   // 优化：错误处理 + 健壮的选择器
-  public async searchDuckDuckGo(query: string): Promise<string> {
+  public async searchDuckDuckGo(query: string, env?: Env): Promise<string> {
     const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 
     // 1. 尝试导航
     try {
-      await this.navigateTo(searchUrl);
+      await this.navigateTo(searchUrl, env);
     } catch (e: any) {
       return `Search navigation failed: ${e.message}`;
     }

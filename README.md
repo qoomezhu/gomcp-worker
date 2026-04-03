@@ -8,9 +8,11 @@ Cloudflare Workers 实现的 gomcp (MCP Server for Lightpanda Browser)。
 - ✅ Streamable HTTP 传输
 - ✅ SSE 传输
 - ✅ Durable Objects 状态管理
-- ✅ CDP WebSocket 客户端
+- ✅ CDP WebSocket 客户端 (自动重连/心跳)
 - ✅ 全球 Edge 部署
 - ✅ Turndown HTML → Markdown 转换
+- ✅ 会话空闲自动清理
+- ✅ 请求取消支持
 
 ## 可用工具
 
@@ -29,7 +31,7 @@ Cloudflare Workers 实现的 gomcp (MCP Server for Lightpanda Browser)。
 npm install
 ```
 
-### 2. 配置 CDP URL
+### 2. 配置环境变量
 
 ```bash
 # 设置 Lightpanda 浏览器的 CDP WebSocket URL
@@ -48,6 +50,15 @@ npm run dev
 ```bash
 npm run deploy
 ```
+
+## 环境变量配置
+
+| 变量 | 描述 | 默认值 |
+|------|------|--------|
+| `CDP_URL` | Lightpanda 浏览器 CDP WebSocket URL | 无 (必填) |
+| `SESSION_IDLE_TIMEOUT_MS` | 会话空闲超时时间 (毫秒) | 600000 (10 分钟) |
+| `CDP_COMMAND_TIMEOUT_MS` | CDP 命令超时时间 (毫秒) | 30000 (30 秒) |
+| `MAX_HTML_LENGTH` | 页面内容最大长度 (字节) | 500000 (500KB) |
 
 ## 使用示例
 
@@ -93,6 +104,7 @@ Lightpanda Browser (CDP)
 - 使用 **Durable Objects** 管理 MCP Session 状态
 - 每个会话有独立的 CDP WebSocket 连接
 - 页面状态在会话间持久化
+- 空闲会话自动清理，节省资源
 
 ## 免费额度
 
@@ -105,12 +117,6 @@ Lightpanda Browser (CDP)
 | SQLite 行读取 | 5,000,000 次/天 |
 | SQLite 行写入 | 100,000 次/天 |
 | 总存储 | 5 GB |
-
-## 环境变量
-
-| 变量 | 描述 | 必需 |
-|------|------|------|
-| `CDP_URL` | Lightpanda 浏览器 CDP WebSocket URL | ✅ |
 
 ## 许可证
 
