@@ -5,7 +5,9 @@ export class CDPClient {
     string,
     { resolve: (value: any) => void; reject: (error: Error) => void }
   > = new Map();
-  private eventListeners: Map<string, ((data: any) => void)[]> = new Map();
+  
+  // 支持 once 选项的监听器结构
+  private eventListeners: Map<string, Array<{ callback: (data: any) => void; once: boolean }>> = new Map();
   private connected: boolean = false;
 
   constructor(url: string) {
@@ -40,6 +42,25 @@ export class CDPClient {
     });
   }
 
+  // 带重试的连接方法
+  async connectWithRetry(maxRetries = 3): Promise<void> {
+    let lastError: Error | undefined;
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        await this.connect();
+        return;
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`CDP connection attempt ${i + 1} failed: ${err.message}`);
+        if (i < maxRetries - 1) {
+          // 指数退避：1s, 2s, 4s...
+          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i)));
+        }
+      }
+    }
+    throw lastError || new Error('CDP connection failed after retries');
+  }
+
   private handleMessage(data: string): void {
     try {
       const message = JSON.parse(data);
@@ -62,8 +83,18 @@ export class CDPClient {
       // 处理事件
       if (message.method) {
         const listeners = this.eventListeners.get(message.method) || [];
-        for (const listener of listeners) {
-          listener(message.params);
+        const toRemove: number[] = [];
+        
+        for (let i = 0; i < listeners.length; i++) {
+          listeners[i].callback(message.params);
+          if (listeners[i].once) {
+            toRemove.push(i);
+          }
+        }
+        
+        // 倒序移除 once 监听器，避免索引偏移
+        for (let i = toRemove.length - 1; i >= 0; i--) {
+          listeners.splice(toRemove[i], 1);
         }
       }
     } catch {
@@ -99,17 +130,17 @@ export class CDPClient {
     });
   }
 
-  on(event: string, callback: (data: any) => void): void {
+  on(event: string, callback: (data: any) => void, options?: { once?: boolean }): void {
     if (!this.eventListeners.has(event)) {
       this.eventListeners.set(event, []);
     }
-    this.eventListeners.get(event)!.push(callback);
+    this.eventListeners.get(event)!.push({ callback, once: options?.once || false });
   }
 
   off(event: string, callback: (data: any) => void): void {
     const listeners = this.eventListeners.get(event);
     if (listeners) {
-      const index = listeners.indexOf(callback);
+      const index = listeners.findIndex(l => l.callback === callback);
       if (index !== -1) {
         listeners.splice(index, 1);
       }
@@ -121,6 +152,8 @@ export class CDPClient {
       this.ws.close();
       this.ws = null;
       this.connected = false;
+      this.pendingRequests.clear();
+      this.eventListeners.clear();
     }
   }
 

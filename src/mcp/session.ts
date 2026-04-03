@@ -64,9 +64,15 @@ export class MCPSession extends DurableObject {
   ): Promise<MCPResponse> {
     this.cdpUrl = cdpUrl;
 
-    // 确保 CDP 连接
-    if (!this.cdpClient) {
+    // 确保 CDP 连接（包含重连逻辑）
+    try {
       await this.ensureCDPConnection();
+    } catch (error: any) {
+      return {
+        jsonrpc: '2.0',
+        error: { code: -32603, message: `CDP Connection Error: ${error.message}` },
+        id: request.id,
+      };
     }
 
     switch (request.method) {
@@ -187,19 +193,34 @@ export class MCPSession extends DurableObject {
     }
   }
 
-  // 确保 CDP 连接
+  // 确保 CDP 连接（带重连逻辑）
   private async ensureCDPConnection(): Promise<void> {
     if (!this.cdpUrl) {
       throw new Error('CDP URL not configured');
     }
 
-    this.cdpClient = new CDPClient(this.cdpUrl);
-    await this.cdpClient.connect();
+    // 如果客户端存在但未连接，尝试重连
+    if (this.cdpClient && !this.cdpClient.isConnected()) {
+      console.warn('CDP connection lost, attempting to reconnect...');
+      this.cdpClient.close();
+      this.cdpClient = null;
+    }
 
-    // 启用 Page 域
-    await this.cdpClient.send('Page.enable', {});
-    await this.cdpClient.send('Runtime.enable', {});
-    await this.cdpClient.send('DOM.enable', {});
+    if (!this.cdpClient) {
+      this.cdpClient = new CDPClient(this.cdpUrl);
+      try {
+        // 使用带重试的连接方法
+        await this.cdpClient.connectWithRetry(3);
+        
+        // 启用必要的域
+        await this.cdpClient.send('Page.enable', {});
+        await this.cdpClient.send('Runtime.enable', {});
+        await this.cdpClient.send('DOM.enable', {});
+      } catch (error) {
+        this.cdpClient = null; // 连接失败，重置
+        throw new Error(`Failed to connect to CDP: ${error}`);
+      }
+    }
   }
 
   // 发送 SSE 事件
@@ -226,26 +247,31 @@ export class MCPSession extends DurableObject {
 
     await this.cdpClient.send('Page.navigate', { url });
 
-    // 等待页面加载
+    // 使用 once 监听器防止泄漏
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
         reject(new Error('Page load timeout'));
       }, 30000);
 
+      // 使用 once: true 确保监听器在触发后自动移除
       this.cdpClient!.on('Page.loadEventFired', () => {
         clearTimeout(timeout);
         resolve();
-      });
+      }, { once: true });
     });
 
     this.pageState.url = url;
     this.pageState.loaded = true;
 
     // 获取页面标题
-    const result = await this.cdpClient.send('Runtime.evaluate', {
-      expression: 'document.title',
-    });
-    this.pageState.title = result.result.value;
+    try {
+      const result = await this.cdpClient.send('Runtime.evaluate', {
+        expression: 'document.title',
+      });
+      this.pageState.title = result.result.value;
+    } catch {
+      this.pageState.title = 'Unknown';
+    }
   }
 
   public async getPageContent(): Promise<string> {
