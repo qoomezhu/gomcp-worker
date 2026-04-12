@@ -1,18 +1,17 @@
 # gomcp-worker
 
-Cloudflare Workers 实现的 gomcp (MCP Server for Lightpanda Browser)。
+Cloudflare Workers 实现的 gomcp（MCP Server for Lightpanda Browser）。
 
 ## 功能特性
 
 - ✅ 支持 MCP 协议版本 `2025-03-26`
-- ✅ Streamable HTTP 传输
-- ✅ SSE 传输
-- ✅ Durable Objects 状态管理
-- ✅ CDP WebSocket 客户端 (自动重连)
-- ✅ 全球 Edge 部署
-- ✅ Turndown HTML → Markdown 转换
-- ✅ 会话空闲自动清理
-- ✅ 请求取消支持
+- ✅ Streamable HTTP JSON-RPC
+- ✅ 轻量 SSE 握手 / 兼容连接
+- ✅ Durable Objects 会话管理
+- ✅ CDP WebSocket 客户端（自动重连）
+- ✅ HTML → Markdown 转换
+- ✅ 会话空闲超时清理
+- ✅ 请求取消标记支持
 
 ## 可用工具
 
@@ -20,8 +19,8 @@ Cloudflare Workers 实现的 gomcp (MCP Server for Lightpanda Browser)。
 |------|------|----------|
 | `goto` | 导航到指定 URL | `url` |
 | `search` | 使用 DuckDuckGo 搜索 | `text` |
-| `markdown` | 获取页面内容的 Markdown | — |
-| `links` | 提取页面所有链接 | — |
+| `markdown` | 获取当前页面 Markdown | — |
+| `links` | 提取当前页面链接 | — |
 
 ## 部署
 
@@ -31,12 +30,16 @@ Cloudflare Workers 实现的 gomcp (MCP Server for Lightpanda Browser)。
 npm install
 ```
 
-### 2. 配置环境变量
+### 2. 配置密钥
 
 ```bash
-# 设置 Lightpanda 浏览器的 CDP WebSocket URL
 wrangler secret set CDP_URL
-# 输入: wss://your-lightpanda-instance:9222
+```
+
+示例值：
+
+```text
+wss://your-lightpanda-instance:9222
 ```
 
 ### 3. 本地开发
@@ -51,9 +54,9 @@ npm run dev
 npm run deploy
 ```
 
-## 使用示例
+> 注意：`wrangler.toml` 已包含 `MCPSession` 的 Durable Object migration。后续如重命名 Durable Object 类，必须继续追加 migration，而不是修改已有 tag。
 
-### MCP 客户端配置
+## MCP 客户端示例
 
 ```json
 {
@@ -65,49 +68,19 @@ npm run deploy
 }
 ```
 
-### 直接调用
+## 直接调用示例
 
 ```bash
-# 初始化
 curl -X POST https://your-worker.workers.dev/mcp \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"initialize","params":{},"id":1}'
-
-# 列出工具
-curl -X POST https://your-worker.workers.dev/mcp \
-  -H "Content-Type: application/json" \
-  -H "Mcp-Session-Id: your-session-id" \
-  -d '{"jsonrpc":"2.0","method":"tools/list","params":{},"id":2}'
 ```
 
-## 架构说明
+## 说明
 
-```
-MCP Client
-    ↓ (HTTP/SSE)
-Cloudflare Workers (Edge)
-    ↓ (WebSocket)
-Lightpanda Browser (CDP)
-```
-
-### 状态管理
-
-- 使用 **Durable Objects** 管理 MCP Session 状态
-- 每个会话有独立的 CDP WebSocket 连接
-- 页面状态在会话间持久化
-- 空闲会话自动清理，节省资源
-
-## 免费额度
-
-### Durable Objects (Workers Free Plan)
-
-| 资源 | 每日免费额度 |
-|------|-------------|
-| 请求数 | 100,000 次/天 |
-| 计算量 | 13,000 GB-s/天 |
-| SQLite 行读取 | 5,000,000 次/天 |
-| SQLite 行写入 | 100,000 次/天 |
-| 总存储 | 5 GB |
+- `GET /mcp` 和 `GET /sse` 返回轻量 SSE 握手流与 `Mcp-Session-Id`，用于兼容需要建立事件流的客户端。
+- 真正的工具调用走 `POST /mcp`。
+- `initialize` / `tools/list` / `ping` 不依赖浏览器 CDP 连接；只有 `tools/call` 需要连接浏览器。
 
 ## 许可证
 

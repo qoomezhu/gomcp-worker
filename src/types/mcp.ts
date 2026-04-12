@@ -16,6 +16,11 @@ export interface MCPResponse {
   id: number | string | null;
 }
 
+export interface PageLink {
+  href: string;
+  text: string;
+}
+
 export interface MCPTool {
   name: string;
   description: string;
