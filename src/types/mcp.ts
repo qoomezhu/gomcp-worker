@@ -1,19 +1,31 @@
+export type MCPRequestId = number | string | null;
+
 export interface MCPRequest {
   jsonrpc: '2.0';
   method: string;
   params?: any;
-  id: number | string | null;
+  id: MCPRequestId;
+}
+
+export interface MCPToolCallContent {
+  type: 'text';
+  text: string;
+}
+
+export interface MCPToolCallResult {
+  content: MCPToolCallContent[];
+  isError?: boolean;
 }
 
 export interface MCPResponse {
   jsonrpc: '2.0';
-  result?: any;
+  result?: unknown;
   error?: {
     code: number;
     message: string;
     data?: any;
   };
-  id: number | string | null;
+  id: MCPRequestId;
 }
 
 export interface PageLink {

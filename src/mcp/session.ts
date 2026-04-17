@@ -1,7 +1,14 @@
 import { DurableObject } from 'cloudflare:workers';
 import { CDPClient } from '../cdp/client';
 import { getEvaluateValue } from './eval';
-import { MCPRequest, MCPResponse, MCPTool, PageLink } from '../types/mcp';
+import {
+  MCPRequest,
+  MCPRequestId,
+  MCPResponse,
+  MCPTool,
+  MCPToolCallResult,
+  PageLink,
+} from '../types/mcp';
 import { GotoTool, SearchTool, MarkdownTool, LinksTool } from '../tools';
 
 const SERVER_INFO = {
@@ -10,18 +17,29 @@ const SERVER_INFO = {
 };
 
 const PROTOCOL_VERSION = '2025-03-26';
+const SESSION_STATE_KEY = 'session_state';
 
 const TOOLS: MCPTool[] = [GotoTool, SearchTool, MarkdownTool, LinksTool];
+const EMPTY_RESOURCES = { resources: [] as Array<Record<string, never>> };
+const EMPTY_PROMPTS = { prompts: [] as Array<Record<string, never>> };
+
+type SessionStatus = 'uninitialized' | 'active' | 'closed';
+
+interface PersistedSessionState {
+  status: SessionStatus;
+  initialized: boolean;
+  lastAccessed: number;
+}
 
 export class MCPSession extends DurableObject {
   private cdpClient: CDPClient | null = null;
   private cdpUrl = '';
+  private cdpSessionId: string | null = null;
+  private cdpTargetId: string | null = null;
   private initialized = false;
-  private pageState = {
-    url: null as string | null,
-    title: null as string | null,
-    loaded: false,
-  };
+  private sessionStatus: SessionStatus = 'uninitialized';
+  private persistedStateLoaded = false;
+  private pageState = this.createEmptyPageState();
   private lastAccessed = Date.now();
   private cancelledRequests: Set<string | number> = new Set();
 
@@ -32,10 +50,23 @@ export class MCPSession extends DurableObject {
   };
 
   async handleRequest(request: MCPRequest, cdpUrl: string): Promise<MCPResponse> {
+    await this.loadPersistedState();
     this.cdpUrl = cdpUrl;
-    const now = Date.now();
 
-    if (request.method !== 'initialize' && now - this.lastAccessed > this.DEFAULTS.IDLE_TIMEOUT_MS) {
+    if (request.method === 'initialize') {
+      return await this.handleInitialize(request);
+    }
+
+    if (this.sessionStatus !== 'active') {
+      return {
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Session is not active' },
+        id: request.id,
+      };
+    }
+
+    const now = Date.now();
+    if (now - this.lastAccessed > this.DEFAULTS.IDLE_TIMEOUT_MS) {
       await this.close();
       return {
         jsonrpc: '2.0',
@@ -45,24 +76,28 @@ export class MCPSession extends DurableObject {
     }
 
     this.lastAccessed = now;
+    await this.persistSessionState();
 
     if (request.method === 'notifications/cancelled') {
-      const idToCancel = request.params?.id;
-      if (idToCancel !== undefined) {
+      const idToCancel = request.params?.requestId;
+      if (typeof idToCancel === 'string' || typeof idToCancel === 'number') {
         this.cancelledRequests.add(idToCancel);
       }
       return { jsonrpc: '2.0', result: null, id: null };
     }
 
     switch (request.method) {
-      case 'initialize':
-        return this.handleInitialize(request);
       case 'tools/list':
         return this.handleToolsList(request);
+      case 'resources/list':
+        return { jsonrpc: '2.0', result: EMPTY_RESOURCES, id: request.id };
+      case 'prompts/list':
+        return { jsonrpc: '2.0', result: EMPTY_PROMPTS, id: request.id };
       case 'ping':
         return { jsonrpc: '2.0', result: {}, id: request.id };
       case 'notifications/initialized':
         this.initialized = true;
+        await this.persistSessionState();
         return { jsonrpc: '2.0', result: null, id: null };
       case 'tools/call':
         try {
@@ -84,19 +119,43 @@ export class MCPSession extends DurableObject {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.cdpClient) {
-      this.cdpClient.close();
-      this.cdpClient = null;
+  public async getStatus(): Promise<SessionStatus> {
+    await this.loadPersistedState();
+
+    if (this.sessionStatus === 'active' && Date.now() - this.lastAccessed > this.DEFAULTS.IDLE_TIMEOUT_MS) {
+      await this.close();
     }
+
+    return this.sessionStatus;
   }
 
-  private handleInitialize(request: MCPRequest): MCPResponse {
+  async close(): Promise<void> {
+    await this.loadPersistedState();
+    this.resetBrowserState();
+    this.cancelledRequests.clear();
+    this.initialized = false;
+    this.sessionStatus = 'closed';
+    this.lastAccessed = Date.now();
+    await this.persistSessionState();
+  }
+
+  private async handleInitialize(request: MCPRequest): Promise<MCPResponse> {
+    this.resetBrowserState();
+    this.cancelledRequests.clear();
+    this.initialized = false;
+    this.sessionStatus = 'active';
+    this.lastAccessed = Date.now();
+    await this.persistSessionState();
+
     return {
       jsonrpc: '2.0',
       result: {
         protocolVersion: PROTOCOL_VERSION,
-        capabilities: { tools: {} },
+        capabilities: {
+          tools: {},
+          resources: {},
+          prompts: {},
+        },
         serverInfo: SERVER_INFO,
       },
       id: request.id,
@@ -128,8 +187,7 @@ export class MCPSession extends DurableObject {
       };
     }
 
-    if (this.cancelledRequests.has(request.id)) {
-      this.cancelledRequests.delete(request.id);
+    if (this.consumeCancellation(request.id)) {
       return {
         jsonrpc: '2.0',
         error: { code: -32800, message: 'Request cancelled by client' },
@@ -137,32 +195,33 @@ export class MCPSession extends DurableObject {
       };
     }
 
-    try {
-      const tool = TOOLS.find((t) => t.name === name);
-      if (!tool) {
-        return {
-          jsonrpc: '2.0',
-          error: { code: -32602, message: `Unknown tool: ${name}` },
-          id: request.id,
-        };
-      }
-
-      const result = await tool.execute(args || {}, this);
+    const tool = TOOLS.find((candidate) => candidate.name === name);
+    if (!tool) {
       return {
         jsonrpc: '2.0',
-        result: {
-          content: [
-            {
-              type: 'text',
-              text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
-            },
-          ],
-        },
+        error: { code: -32602, message: `Unknown tool: ${name}` },
+        id: request.id,
+      };
+    }
+
+    try {
+      const result = await tool.execute(args || {}, this);
+      const toolResult: MCPToolCallResult = {
+        content: [
+          {
+            type: 'text',
+            text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+
+      return {
+        jsonrpc: '2.0',
+        result: toolResult,
         id: request.id,
       };
     } catch (error: any) {
-      if (this.cancelledRequests.has(request.id)) {
-        this.cancelledRequests.delete(request.id);
+      if (this.consumeCancellation(request.id)) {
         return {
           jsonrpc: '2.0',
           error: { code: -32800, message: 'Request cancelled' },
@@ -170,12 +229,19 @@ export class MCPSession extends DurableObject {
         };
       }
 
+      const toolResult: MCPToolCallResult = {
+        content: [
+          {
+            type: 'text',
+            text: error?.message || 'Internal error',
+          },
+        ],
+        isError: true,
+      };
+
       return {
         jsonrpc: '2.0',
-        error: {
-          code: -32603,
-          message: error.message || 'Internal error',
-        },
+        result: toolResult,
         id: request.id,
       };
     }
@@ -186,97 +252,111 @@ export class MCPSession extends DurableObject {
       throw new Error('CDP URL not configured');
     }
 
-    if (this.cdpClient && !this.cdpClient.isConnected()) {
-      this.cdpClient.close();
-      this.cdpClient = null;
+    if (this.cdpClient && (!this.cdpClient.isConnected() || !this.cdpSessionId)) {
+      this.resetBrowserState();
     }
 
     if (!this.cdpClient) {
-      this.cdpClient = new CDPClient(this.cdpUrl);
-      try {
-        await this.cdpClient.connectWithRetry(3);
-        await this.cdpClient.send('Page.enable', {});
-        await this.cdpClient.send('Runtime.enable', {});
-        await this.cdpClient.send('DOM.enable', {});
-      } catch (error) {
-        this.cdpClient = null;
-        throw new Error(`Failed to connect to CDP: ${error}`);
-      }
+      const client = new CDPClient(this.cdpUrl);
+      await client.connectWithRetry(3);
+
+      const { targetId, sessionId } = await client.attachToNewTarget();
+      await client.send('Page.enable', {}, sessionId);
+      await client.send('Runtime.enable', {}, sessionId);
+      await client.send('DOM.enable', {}, sessionId);
+
+      this.cdpClient = client;
+      this.cdpTargetId = targetId;
+      this.cdpSessionId = sessionId;
+      this.pageState = this.createEmptyPageState();
     }
   }
 
   public async navigateTo(url: string): Promise<void> {
-    if (!this.cdpClient) {
+    if (!this.cdpClient || !this.cdpSessionId) {
       throw new Error('CDP not connected');
     }
 
-    await this.cdpClient.send('Page.navigate', { url });
-
-    const timeoutMs = this.DEFAULTS.COMMAND_TIMEOUT_MS;
-
-    await new Promise<void>((resolve, reject) => {
-      const handler = () => {
-        clearTimeout(timeout);
-        this.cdpClient?.off('Page.loadEventFired', handler);
-        resolve();
-      };
-
-      const timeout = setTimeout(() => {
-        this.cdpClient?.off('Page.loadEventFired', handler);
-        reject(new Error('Page load timeout'));
-      }, timeoutMs);
-
-      this.cdpClient.on('Page.loadEventFired', handler);
+    const waitForLoad = this.cdpClient.waitForAnyEvent(['Page.loadEventFired'], {
+      sessionId: this.cdpSessionId,
+      timeoutMs: this.DEFAULTS.COMMAND_TIMEOUT_MS,
     });
 
-    this.pageState.url = url;
-    this.pageState.loaded = true;
+    this.pageState = {
+      url,
+      title: null,
+      loaded: false,
+    };
 
-    try {
-      const result = await this.cdpClient.send('Runtime.evaluate', {
+    await this.cdpClient.send('Page.navigate', { url }, this.cdpSessionId);
+    await waitForLoad;
+
+    const result = await this.cdpClient.send<any>(
+      'Runtime.evaluate',
+      {
         expression: 'document.title',
-      });
-      this.pageState.title = getEvaluateValue<string>(result) ?? 'Unknown';
-    } catch {
-      this.pageState.title = 'Unknown';
-    }
+        returnByValue: true,
+      },
+      this.cdpSessionId
+    );
+
+    this.pageState = {
+      url,
+      title: getEvaluateValue<string>(result) ?? 'Unknown',
+      loaded: true,
+    };
   }
 
   public async getPageContent(): Promise<string> {
-    if (!this.cdpClient) {
+    this.assertPageLoaded();
+
+    if (!this.cdpClient || !this.cdpSessionId) {
       throw new Error('CDP not connected');
     }
 
-    const cleanedHtml = await this.cdpClient.send('Runtime.evaluate', {
-      expression: `
-        (function() {
-          const clone = document.documentElement.cloneNode(true);
-          clone.querySelectorAll('script, style, noscript, iframe, svg, link, meta').forEach(el => el.remove());
-          return clone.outerHTML;
-        })()
-      `,
-    });
+    const cleanedHtml = await this.cdpClient.send<any>(
+      'Runtime.evaluate',
+      {
+        expression: `
+          (function () {
+            const clone = document.documentElement.cloneNode(true);
+            clone.querySelectorAll('script, style, noscript, iframe, svg, link, meta').forEach((el) => el.remove());
+            return clone.outerHTML;
+          })()
+        `,
+        returnByValue: true,
+      },
+      this.cdpSessionId
+    );
 
     let html = getEvaluateValue<string>(cleanedHtml) || '';
-
     if (html.length > this.DEFAULTS.MAX_HTML_LENGTH) {
-      html = html.substring(0, this.DEFAULTS.MAX_HTML_LENGTH) + '\n\n... [Content Truncated due to length limit]';
+      html = html.substring(0, this.DEFAULTS.MAX_HTML_LENGTH) + '\n\n... [Content truncated due to length limit]';
     }
 
     return html;
   }
 
   public async getPageLinks(): Promise<PageLink[]> {
-    if (!this.cdpClient) {
+    this.assertPageLoaded();
+
+    if (!this.cdpClient || !this.cdpSessionId) {
       throw new Error('CDP not connected');
     }
 
-    const result = await this.cdpClient.send('Runtime.evaluate', {
-      expression: `Array.from(document.querySelectorAll('a')).map(a => ({
-        href: a.href,
-        text: a.textContent?.trim() || ''
-      }))`,
-    });
+    const result = await this.cdpClient.send<any>(
+      'Runtime.evaluate',
+      {
+        expression: `
+          Array.from(document.querySelectorAll('a[href]')).map((anchor) => ({
+            href: anchor.href,
+            text: anchor.textContent?.trim() || ''
+          }))
+        `,
+        returnByValue: true,
+      },
+      this.cdpSessionId
+    );
 
     return getEvaluateValue<PageLink[]>(result) || [];
   }
@@ -284,38 +364,103 @@ export class MCPSession extends DurableObject {
   public async searchDuckDuckGo(query: string): Promise<string> {
     const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 
-    try {
-      await this.navigateTo(searchUrl);
-    } catch (e: any) {
-      return `Search navigation failed: ${e.message}`;
+    await this.navigateTo(searchUrl);
+
+    if (!this.cdpClient || !this.cdpSessionId) {
+      throw new Error('CDP not connected');
     }
 
-    try {
-      const results = await this.cdpClient!.send('Runtime.evaluate', {
+    const results = await this.cdpClient.send<any>(
+      'Runtime.evaluate',
+      {
         expression: `
-          Array.from(document.querySelectorAll('.result')).map(r => {
-            const titleEl = r.querySelector('.result__title a');
-            const snippetEl = r.querySelector('.result__snippet');
+          Array.from(document.querySelectorAll('.result')).map((result) => {
+            const titleEl = result.querySelector('.result__title a');
+            const snippetEl = result.querySelector('.result__snippet');
             return {
               title: titleEl?.textContent?.trim() || '',
               url: titleEl?.href || '',
               snippet: snippetEl?.textContent?.trim() || ''
             };
-          }).filter(r => r.url && r.title);
+          }).filter((entry) => entry.url && entry.title)
         `,
-      });
+        returnByValue: true,
+      },
+      this.cdpSessionId
+    );
 
-      const data = getEvaluateValue<Array<{ title: string; url: string; snippet: string }>>(results) || [];
-      if (data.length === 0) {
-        return 'No search results found.';
-      }
-      return JSON.stringify(data, null, 2);
-    } catch (e: any) {
-      return `Failed to extract search results: ${e.message}`;
+    const data = getEvaluateValue<Array<{ title: string; url: string; snippet: string }>>(results) || [];
+    if (data.length === 0) {
+      return 'No search results found.';
     }
+
+    return JSON.stringify(data, null, 2);
   }
 
   public getPageState() {
     return { ...this.pageState };
+  }
+
+  private createEmptyPageState() {
+    return {
+      url: null as string | null,
+      title: null as string | null,
+      loaded: false,
+    };
+  }
+
+  private resetBrowserState(): void {
+    if (this.cdpClient) {
+      this.cdpClient.close();
+    }
+
+    this.cdpClient = null;
+    this.cdpSessionId = null;
+    this.cdpTargetId = null;
+    this.pageState = this.createEmptyPageState();
+  }
+
+  private async loadPersistedState(): Promise<void> {
+    if (this.persistedStateLoaded) {
+      return;
+    }
+
+    const storedState = await this.ctx.storage.get<PersistedSessionState>(SESSION_STATE_KEY);
+    if (storedState) {
+      this.sessionStatus = storedState.status;
+      this.initialized = storedState.initialized;
+      this.lastAccessed = storedState.lastAccessed;
+    }
+
+    this.persistedStateLoaded = true;
+  }
+
+  private async persistSessionState(): Promise<void> {
+    const persistedState: PersistedSessionState = {
+      status: this.sessionStatus,
+      initialized: this.initialized,
+      lastAccessed: this.lastAccessed,
+    };
+
+    await this.ctx.storage.put(SESSION_STATE_KEY, persistedState);
+  }
+
+  private assertPageLoaded(): void {
+    if (!this.pageState.loaded) {
+      throw new Error('No page loaded. Use goto or search first.');
+    }
+  }
+
+  private consumeCancellation(requestId: MCPRequestId): boolean {
+    if (requestId === null) {
+      return false;
+    }
+
+    if (!this.cancelledRequests.has(requestId)) {
+      return false;
+    }
+
+    this.cancelledRequests.delete(requestId);
+    return true;
   }
 }

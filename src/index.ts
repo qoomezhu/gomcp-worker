@@ -1,5 +1,6 @@
 import { MCPSession } from './mcp/session';
 import { createSSEHandshakeResponse } from './mcp/sse';
+import { resolveSessionIdForRequest } from './mcp/http';
 
 export { MCPSession, createSSEHandshakeResponse };
 
@@ -26,57 +27,67 @@ function createErrorResponse(code: number, message: string, id: number | string 
   return { jsonrpc: '2.0', error, id };
 }
 
+function createCorsHeaders(): Record<string, string> {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Accept, Authorization, Content-Type, Mcp-Session-Id, MCP-Protocol-Version',
+    'Access-Control-Expose-Headers': 'Mcp-Session-Id',
+  };
+}
+
+function createJSONResponse(
+  body: unknown,
+  status: number,
+  corsHeaders: Record<string, string>,
+  extraHeaders: Record<string, string> = {}
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      ...corsHeaders,
+      ...extraHeaders,
+      'Content-Type': 'application/json',
+    },
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Mcp-Session-Id',
-    };
+    const corsHeaders = createCorsHeaders();
 
     if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
+      return new Response(null, { status: 204, headers: corsHeaders });
     }
 
     try {
       if (url.pathname === '/mcp') {
-        const requestedSessionId = request.headers.get('Mcp-Session-Id');
-
         switch (request.method) {
-          case 'GET': {
-            const sessionId = requestedSessionId || crypto.randomUUID();
-            return createSSEHandshakeResponse(sessionId, corsHeaders, '/mcp');
-          }
-          case 'POST': {
-            const sessionId = requestedSessionId || crypto.randomUUID();
-            return await handleJSONRPC(request, env, sessionId, corsHeaders);
-          }
+          case 'GET':
+            return await handleSSERequest(env, request.headers.get('Mcp-Session-Id'), corsHeaders, '/mcp');
+          case 'POST':
+            return await handleJSONRPC(request, env, corsHeaders);
           case 'DELETE':
-            return await handleDeleteSession(env, requestedSessionId, corsHeaders);
+            return await handleDeleteSession(env, request.headers.get('Mcp-Session-Id'), corsHeaders);
           default:
-            return new Response(
-              JSON.stringify(createErrorResponse(MCPErrorCodes.INVALID_REQUEST, `Method ${request.method} not allowed`)),
-              {
-                status: 405,
-                headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-              }
+            return createJSONResponse(
+              createErrorResponse(MCPErrorCodes.INVALID_REQUEST, `Method ${request.method} not allowed`),
+              405,
+              corsHeaders
             );
         }
       }
 
       if (url.pathname === '/sse') {
         if (request.method === 'GET') {
-          const sessionId = request.headers.get('Mcp-Session-Id') || crypto.randomUUID();
-          return createSSEHandshakeResponse(sessionId, corsHeaders, '/mcp');
+          return await handleSSERequest(env, request.headers.get('Mcp-Session-Id'), corsHeaders, '/mcp');
         }
 
-        return new Response(
-          JSON.stringify(createErrorResponse(MCPErrorCodes.INVALID_REQUEST, 'Only GET method allowed for SSE endpoint')),
-          {
-            status: 405,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-          }
+        return createJSONResponse(
+          createErrorResponse(MCPErrorCodes.INVALID_REQUEST, 'Only GET method allowed for SSE endpoint'),
+          405,
+          corsHeaders
         );
       }
 
@@ -84,30 +95,51 @@ export default {
         return await handleHealthCheck(env, corsHeaders);
       }
 
-      return new Response(
-        JSON.stringify(createErrorResponse(MCPErrorCodes.METHOD_NOT_FOUND, `Not Found: ${url.pathname}`)),
-        {
-          status: 404,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        }
+      return createJSONResponse(
+        createErrorResponse(MCPErrorCodes.METHOD_NOT_FOUND, `Not Found: ${url.pathname}`),
+        404,
+        corsHeaders
       );
     } catch (error: any) {
       console.error('Worker unhandled error:', error);
-      return new Response(
-        JSON.stringify(createErrorResponse(MCPErrorCodes.INTERNAL_ERROR, 'Internal server error', null, { message: error.message })),
-        {
-          status: 500,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        }
+      return createJSONResponse(
+        createErrorResponse(MCPErrorCodes.INTERNAL_ERROR, 'Internal server error', null, { message: error.message }),
+        500,
+        corsHeaders
       );
     }
   },
 };
 
+async function handleSSERequest(
+  env: Env,
+  sessionId: string | null,
+  corsHeaders: Record<string, string>,
+  endpoint: string
+): Promise<Response> {
+  if (!sessionId) {
+    return createJSONResponse(
+      createErrorResponse(MCPErrorCodes.INVALID_PARAMS, 'Missing Mcp-Session-Id header'),
+      400,
+      corsHeaders
+    );
+  }
+
+  const status = await getSessionStatus(env, sessionId);
+  if (status !== 'active') {
+    return createJSONResponse(
+      createErrorResponse(MCPErrorCodes.INVALID_PARAMS, `Unknown or expired session: ${sessionId}`),
+      404,
+      corsHeaders
+    );
+  }
+
+  return createSSEHandshakeResponse(sessionId, corsHeaders, endpoint);
+}
+
 async function handleJSONRPC(
   request: Request,
   env: Env,
-  sessionId: string,
   corsHeaders: Record<string, string>
 ): Promise<Response> {
   let body: any;
@@ -116,12 +148,10 @@ async function handleJSONRPC(
   try {
     const contentType = request.headers.get('Content-Type') || '';
     if (!contentType.includes('application/json')) {
-      return new Response(
-        JSON.stringify(createErrorResponse(MCPErrorCodes.INVALID_REQUEST, 'Content-Type must be application/json')),
-        {
-          status: 415,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        }
+      return createJSONResponse(
+        createErrorResponse(MCPErrorCodes.INVALID_REQUEST, 'Content-Type must be application/json'),
+        415,
+        corsHeaders
       );
     }
 
@@ -129,54 +159,66 @@ async function handleJSONRPC(
     requestId = body?.id ?? null;
   } catch (parseError: any) {
     console.error('JSON parse error:', parseError);
-    return new Response(
-      JSON.stringify(createErrorResponse(MCPErrorCodes.PARSE_ERROR, `Parse error: ${parseError.message || 'Invalid JSON'}`)),
-      {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      }
+    return createJSONResponse(
+      createErrorResponse(MCPErrorCodes.PARSE_ERROR, `Parse error: ${parseError.message || 'Invalid JSON'}`),
+      400,
+      corsHeaders
     );
   }
 
-  if (body.jsonrpc !== '2.0') {
-    return new Response(
-      JSON.stringify(createErrorResponse(MCPErrorCodes.INVALID_REQUEST, 'Invalid JSON-RPC version, expected "2.0"', requestId)),
-      {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      }
+  if (body?.jsonrpc !== '2.0') {
+    return createJSONResponse(
+      createErrorResponse(MCPErrorCodes.INVALID_REQUEST, 'Invalid JSON-RPC version, expected "2.0"', requestId),
+      400,
+      corsHeaders
     );
   }
 
-  if (!body.method || typeof body.method !== 'string') {
-    return new Response(
-      JSON.stringify(createErrorResponse(MCPErrorCodes.INVALID_REQUEST, 'Missing or invalid method', requestId)),
-      {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      }
+  if (!body?.method || typeof body.method !== 'string') {
+    return createJSONResponse(
+      createErrorResponse(MCPErrorCodes.INVALID_REQUEST, 'Missing or invalid method', requestId),
+      400,
+      corsHeaders
     );
+  }
+
+  const resolution = resolveSessionIdForRequest(
+    { method: body.method },
+    request.headers.get('Mcp-Session-Id')
+  );
+
+  if (!resolution.ok || !resolution.sessionId) {
+    return createJSONResponse(
+      createErrorResponse(MCPErrorCodes.INVALID_PARAMS, resolution.errorMessage || 'Invalid session request', requestId),
+      resolution.errorStatus || 400,
+      corsHeaders
+    );
+  }
+
+  const sessionId = resolution.sessionId;
+  const session = env.MCP_SESSION.get(env.MCP_SESSION.idFromName(sessionId));
+
+  if (body.method !== 'initialize') {
+    const status = await session.getStatus();
+    if (status !== 'active') {
+      return createJSONResponse(
+        createErrorResponse(MCPErrorCodes.INVALID_PARAMS, `Unknown or expired session: ${sessionId}`, requestId),
+        404,
+        corsHeaders
+      );
+    }
   }
 
   try {
-    const session = env.MCP_SESSION.get(env.MCP_SESSION.idFromName(sessionId));
     const response = await session.handleRequest(body, env.CDP_URL || '');
-
-    return new Response(JSON.stringify(response), {
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'application/json',
-        'Mcp-Session-Id': sessionId,
-      },
-    });
+    return createJSONResponse(response, 200, corsHeaders, { 'Mcp-Session-Id': sessionId });
   } catch (error: any) {
     console.error('Session request error:', error);
-    return new Response(
-      JSON.stringify(createErrorResponse(MCPErrorCodes.INTERNAL_ERROR, `Session error: ${error.message}`, requestId)),
-      {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Mcp-Session-Id': sessionId },
-      }
+    return createJSONResponse(
+      createErrorResponse(MCPErrorCodes.INTERNAL_ERROR, `Session error: ${error.message}`, requestId),
+      500,
+      corsHeaders,
+      { 'Mcp-Session-Id': sessionId }
     );
   }
 }
@@ -187,33 +229,45 @@ async function handleDeleteSession(
   corsHeaders: Record<string, string>
 ): Promise<Response> {
   if (!sessionId) {
-    return new Response(
-      JSON.stringify(createErrorResponse(MCPErrorCodes.INVALID_PARAMS, 'Missing Mcp-Session-Id header')),
-      {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      }
+    return createJSONResponse(
+      createErrorResponse(MCPErrorCodes.INVALID_PARAMS, 'Missing Mcp-Session-Id header'),
+      400,
+      corsHeaders
+    );
+  }
+
+  const session = env.MCP_SESSION.get(env.MCP_SESSION.idFromName(sessionId));
+  const status = await session.getStatus();
+  if (status !== 'active') {
+    return createJSONResponse(
+      createErrorResponse(MCPErrorCodes.INVALID_PARAMS, `Unknown or expired session: ${sessionId}`),
+      404,
+      corsHeaders
     );
   }
 
   try {
-    const session = env.MCP_SESSION.get(env.MCP_SESSION.idFromName(sessionId));
     await session.close();
-
-    return new Response(JSON.stringify({ jsonrpc: '2.0', result: { closed: true }, id: null }), {
-      status: 200,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    return new Response(null, {
+      status: 204,
+      headers: {
+        ...corsHeaders,
+        'Mcp-Session-Id': sessionId,
+      },
     });
   } catch (error: any) {
     console.error('Session close error:', error);
-    return new Response(
-      JSON.stringify(createErrorResponse(MCPErrorCodes.INTERNAL_ERROR, `Failed to close session: ${error.message}`)),
-      {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      }
+    return createJSONResponse(
+      createErrorResponse(MCPErrorCodes.INTERNAL_ERROR, `Failed to close session: ${error.message}`),
+      500,
+      corsHeaders
     );
   }
+}
+
+async function getSessionStatus(env: Env, sessionId: string): Promise<'active' | 'uninitialized' | 'closed'> {
+  const session = env.MCP_SESSION.get(env.MCP_SESSION.idFromName(sessionId));
+  return await session.getStatus();
 }
 
 async function handleHealthCheck(env: Env, corsHeaders: Record<string, string>): Promise<Response> {
@@ -241,8 +295,5 @@ async function handleHealthCheck(env: Env, corsHeaders: Record<string, string>):
     }
   }
 
-  return new Response(JSON.stringify(checks), {
-    status: checks.status === 'ok' ? 200 : 503,
-    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-  });
+  return createJSONResponse(checks, checks.status === 'ok' ? 200 : 503, corsHeaders);
 }

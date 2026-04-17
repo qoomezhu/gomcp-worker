@@ -1,20 +1,37 @@
+type PendingRequest = {
+  resolve: (value: any) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+};
+
+type EventListener = {
+  callback: (params: any, message: any) => void;
+  once: boolean;
+  sessionId?: string;
+};
+
+export interface AttachedTarget {
+  targetId: string;
+  sessionId: string;
+}
+
 export class CDPClient {
   private ws: WebSocket | null = null;
-  private url: string;
-  private pendingRequests: Map<
-    string,
-    { resolve: (value: any) => void; reject: (error: Error) => void }
-  > = new Map();
-  
-  // 支持 once 选项的监听器结构
-  private eventListeners: Map<string, Array<{ callback: (data: any) => void; once: boolean }>> = new Map();
-  private connected: boolean = false;
+  private readonly url: string;
+  private readonly pendingRequests: Map<number, PendingRequest> = new Map();
+  private readonly eventListeners: Map<string, EventListener[]> = new Map();
+  private connected = false;
+  private nextRequestId = 0;
 
   constructor(url: string) {
     this.url = url;
   }
 
   async connect(): Promise<void> {
+    if (this.connected && this.ws) {
+      return;
+    }
+
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(this.url);
 
@@ -25,125 +42,157 @@ export class CDPClient {
 
       this.ws.onclose = () => {
         this.connected = false;
-        // 拒绝所有待处理的请求
-        for (const [id, { reject: rej }] of this.pendingRequests) {
-          rej(new Error('WebSocket closed'));
-        }
-        this.pendingRequests.clear();
+        this.failPendingRequests(new Error('WebSocket closed'));
       };
 
       this.ws.onerror = (error) => {
-        reject(new Error(`WebSocket error: ${error}`));
+        reject(new Error(`WebSocket error: ${String(error)}`));
       };
 
       this.ws.onmessage = (event) => {
-        this.handleMessage(event.data);
+        const data = typeof event.data === 'string' ? event.data : '';
+        this.handleMessage(data);
       };
     });
   }
 
-  // 带重试的连接方法
   async connectWithRetry(maxRetries = 3): Promise<void> {
     let lastError: Error | undefined;
-    for (let i = 0; i < maxRetries; i++) {
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         await this.connect();
         return;
-      } catch (err: any) {
-        lastError = err;
-        console.warn(`CDP connection attempt ${i + 1} failed: ${err.message}`);
-        if (i < maxRetries - 1) {
-          // 指数退避：1s, 2s, 4s...
-          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i)));
+      } catch (error: any) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        console.warn(`CDP connection attempt ${attempt + 1} failed: ${lastError.message}`);
+
+        if (attempt < maxRetries - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
         }
       }
     }
-    throw lastError || new Error('CDP connection failed after retries');
+
+    throw lastError ?? new Error('CDP connection failed after retries');
   }
 
-  private handleMessage(data: string): void {
-    try {
-      const message = JSON.parse(data);
+  async attachToNewTarget(): Promise<AttachedTarget> {
+    const targetResponse = await this.send<any>('Target.createTarget', { url: 'about:blank' });
+    const targetId = targetResponse?.result?.targetId;
 
-      // 处理响应
-      if (message.id && this.pendingRequests.has(String(message.id))) {
-        const { resolve, reject } = this.pendingRequests.get(
-          String(message.id)
-        )!;
-        this.pendingRequests.delete(String(message.id));
-
-        if (message.error) {
-          reject(new Error(message.error.message || 'CDP Error'));
-        } else {
-          resolve(message);
-        }
-        return;
-      }
-
-      // 处理事件
-      if (message.method) {
-        const listeners = this.eventListeners.get(message.method) || [];
-        const toRemove: number[] = [];
-        
-        for (let i = 0; i < listeners.length; i++) {
-          listeners[i].callback(message.params);
-          if (listeners[i].once) {
-            toRemove.push(i);
-          }
-        }
-        
-        // 倒序移除 once 监听器，避免索引偏移
-        for (let i = toRemove.length - 1; i >= 0; i--) {
-          listeners.splice(toRemove[i], 1);
-        }
-      }
-    } catch {
-      // 忽略解析错误
+    if (!targetId) {
+      throw new Error('Target.createTarget did not return a targetId');
     }
+
+    const attachResponse = await this.send<any>('Target.attachToTarget', {
+      targetId,
+      flatten: true,
+    });
+    const sessionId = attachResponse?.result?.sessionId;
+
+    if (!sessionId) {
+      throw new Error('Target.attachToTarget did not return a sessionId');
+    }
+
+    return { targetId, sessionId };
   }
 
-  async send(method: string, params: Record<string, any> = {}): Promise<any> {
+  async waitForAnyEvent(
+    methods: string[],
+    options: { sessionId?: string; timeoutMs?: number } = {}
+  ): Promise<{ method: string; params: any; message: any }> {
+    if (methods.length === 0) {
+      throw new Error('At least one CDP event must be provided');
+    }
+
+    const timeoutMs = options.timeoutMs ?? 30000;
+
+    return new Promise((resolve, reject) => {
+      const listeners: Array<{
+        method: string;
+        callback: (params: any, message: any) => void;
+      }> = [];
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        for (const listener of listeners) {
+          this.off(listener.method, listener.callback);
+        }
+      };
+
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`CDP event timeout: ${methods.join(', ')}`));
+      }, timeoutMs);
+
+      for (const method of methods) {
+        const callback = (params: any, message: any) => {
+          cleanup();
+          resolve({ method, params, message });
+        };
+
+        listeners.push({ method, callback });
+        this.on(method, callback, { once: true, sessionId: options.sessionId });
+      }
+    });
+  }
+
+  async send<T = any>(method: string, params: Record<string, any> = {}, sessionId?: string): Promise<T> {
     if (!this.ws || !this.connected) {
       throw new Error('CDP not connected');
     }
 
-    const id = crypto.randomUUID();
+    const id = ++this.nextRequestId;
 
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject });
-
-      this.ws!.send(
-        JSON.stringify({
-          id,
-          method,
-          params,
-        })
-      );
-
-      // 设置超时
-      setTimeout(() => {
+      const timeout = setTimeout(() => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
           reject(new Error(`CDP command timeout: ${method}`));
         }
       }, 30000);
+
+      this.pendingRequests.set(id, { resolve, reject, timeout });
+
+      const payload: Record<string, any> = {
+        id,
+        method,
+        params,
+      };
+
+      if (sessionId) {
+        payload.sessionId = sessionId;
+      }
+
+      this.ws!.send(JSON.stringify(payload));
     });
   }
 
-  on(event: string, callback: (data: any) => void, options?: { once?: boolean }): void {
+  on(
+    event: string,
+    callback: (params: any, message: any) => void,
+    options?: { once?: boolean; sessionId?: string }
+  ): void {
     if (!this.eventListeners.has(event)) {
       this.eventListeners.set(event, []);
     }
-    this.eventListeners.get(event)!.push({ callback, once: options?.once || false });
+
+    this.eventListeners.get(event)!.push({
+      callback,
+      once: options?.once ?? false,
+      sessionId: options?.sessionId,
+    });
   }
 
-  off(event: string, callback: (data: any) => void): void {
+  off(event: string, callback: (params: any, message: any) => void): void {
     const listeners = this.eventListeners.get(event);
-    if (listeners) {
-      const index = listeners.findIndex(l => l.callback === callback);
-      if (index !== -1) {
-        listeners.splice(index, 1);
-      }
+    if (!listeners) {
+      return;
+    }
+
+    const index = listeners.findIndex((listener) => listener.callback === callback);
+    if (index !== -1) {
+      listeners.splice(index, 1);
     }
   }
 
@@ -152,12 +201,61 @@ export class CDPClient {
       this.ws.close();
       this.ws = null;
     }
+
     this.connected = false;
-    this.pendingRequests.clear();
+    this.failPendingRequests(new Error('WebSocket closed'));
     this.eventListeners.clear();
   }
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  private handleMessage(data: string): void {
+    try {
+      const message = JSON.parse(data);
+
+      if (typeof message?.id === 'number' && this.pendingRequests.has(message.id)) {
+        const pending = this.pendingRequests.get(message.id)!;
+        this.pendingRequests.delete(message.id);
+        clearTimeout(pending.timeout);
+
+        if (message.error) {
+          pending.reject(new Error(message.error.message || 'CDP error'));
+        } else {
+          pending.resolve(message);
+        }
+        return;
+      }
+
+      if (typeof message?.method === 'string') {
+        const listeners = this.eventListeners.get(message.method) ?? [];
+        const remaining: EventListener[] = [];
+
+        for (const listener of listeners) {
+          if (listener.sessionId && listener.sessionId !== message.sessionId) {
+            remaining.push(listener);
+            continue;
+          }
+
+          listener.callback(message.params, message);
+          if (!listener.once) {
+            remaining.push(listener);
+          }
+        }
+
+        this.eventListeners.set(message.method, remaining);
+      }
+    } catch {
+      // Ignore malformed CDP payloads.
+    }
+  }
+
+  private failPendingRequests(error: Error): void {
+    for (const [id, pending] of this.pendingRequests) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+      this.pendingRequests.delete(id);
+    }
   }
 }
