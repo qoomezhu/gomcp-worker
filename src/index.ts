@@ -1,12 +1,14 @@
 import { MCPSession } from './mcp/session';
 import { createSSEHandshakeResponse } from './mcp/sse';
 import { resolveSessionIdForRequest } from './mcp/http';
+import type { MCPResponse } from './types/mcp';
 
 export { MCPSession, createSSEHandshakeResponse };
 
 export interface Env {
-  MCP_SESSION: DurableObjectNamespace;
+  MCP_SESSION: DurableObjectNamespace<MCPSession>;
   CDP_URL?: string;
+  ALLOWED_ORIGINS?: string;
 }
 
 const MCPErrorCodes = {
@@ -27,12 +29,35 @@ function createErrorResponse(code: number, message: string, id: number | string 
   return { jsonrpc: '2.0', error, id };
 }
 
-function createCorsHeaders(): Record<string, string> {
+function getAllowedOrigin(request: Request, env: Env): string {
+  const allowedOrigins = env.ALLOWED_ORIGINS?.trim();
+  if (!allowedOrigins || allowedOrigins === '*') {
+    return '*';
+  }
+
+  const origin = request.headers.get('Origin');
+  if (!origin) {
+    // No Origin header  —  return the first allowed origin for non-browser clients
+    return allowedOrigins.split(',')[0].trim();
+  }
+
+  const allowed = allowedOrigins.split(',').map(o => o.trim());
+  if (allowed.includes(origin)) {
+    return origin;
+  }
+
+  // Origin not in whitelist  —  return first allowed origin (browsers will block, non-browser clients don't care)
+  return allowed[0];
+}
+
+function createCorsHeaders(request: Request, env: Env): Record<string, string> {
+  const origin = getAllowedOrigin(request, env);
   return {
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Accept, Authorization, Content-Type, Mcp-Session-Id, MCP-Protocol-Version',
     'Access-Control-Expose-Headers': 'Mcp-Session-Id',
+    ...(origin !== '*' ? { Vary: 'Origin' } : {}),
   };
 }
 
@@ -52,10 +77,24 @@ function createJSONResponse(
   });
 }
 
+function createEmptyResponse(
+  status: number,
+  corsHeaders: Record<string, string>,
+  extraHeaders: Record<string, string> = {}
+): Response {
+  return new Response(null, {
+    status,
+    headers: {
+      ...corsHeaders,
+      ...extraHeaders,
+    },
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const corsHeaders = createCorsHeaders();
+    const corsHeaders = createCorsHeaders(request, env);
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });
@@ -65,7 +104,7 @@ export default {
       if (url.pathname === '/mcp') {
         switch (request.method) {
           case 'GET':
-            return await handleSSERequest(env, request.headers.get('Mcp-Session-Id'), corsHeaders, '/mcp');
+            return await handleSSERequest(env, request, corsHeaders, '/mcp');
           case 'POST':
             return await handleJSONRPC(request, env, corsHeaders);
           case 'DELETE':
@@ -81,7 +120,7 @@ export default {
 
       if (url.pathname === '/sse') {
         if (request.method === 'GET') {
-          return await handleSSERequest(env, request.headers.get('Mcp-Session-Id'), corsHeaders, '/mcp');
+          return await handleSSERequest(env, request, corsHeaders, '/mcp');
         }
 
         return createJSONResponse(
@@ -113,10 +152,11 @@ export default {
 
 async function handleSSERequest(
   env: Env,
-  sessionId: string | null,
+  request: Request,
   corsHeaders: Record<string, string>,
   endpoint: string
 ): Promise<Response> {
+  const sessionId = request.headers.get('Mcp-Session-Id');
   if (!sessionId) {
     return createJSONResponse(
       createErrorResponse(MCPErrorCodes.INVALID_PARAMS, 'Missing Mcp-Session-Id header'),
@@ -210,7 +250,13 @@ async function handleJSONRPC(
   }
 
   try {
-    const response = await session.handleRequest(body, env.CDP_URL || '');
+    const response: MCPResponse = await session.handleRequest(body, env.CDP_URL || '');
+
+    // MCP Streamable HTTP: notifications (id:null) → HTTP 202 with no body
+    if (response.id === null && response.result === undefined && response.error === undefined) {
+      return createEmptyResponse(202, corsHeaders, { 'Mcp-Session-Id': sessionId });
+    }
+
     return createJSONResponse(response, 200, corsHeaders, { 'Mcp-Session-Id': sessionId });
   } catch (error: any) {
     console.error('Session request error:', error);
@@ -277,22 +323,18 @@ async function handleHealthCheck(env: Env, corsHeaders: Record<string, string>):
     version: '1.0.0',
   };
 
-  if (!env.CDP_URL) {
-    checks.cdp = { status: 'not_configured', healthy: false };
-    checks.status = 'degraded';
-  } else {
-    try {
-      const cdpUrl = new URL(env.CDP_URL);
-      checks.cdp = {
-        status: 'configured',
-        healthy: true,
-        protocol: cdpUrl.protocol,
-        host: cdpUrl.host,
-      };
-    } catch {
-      checks.cdp = { status: 'invalid_url', healthy: false };
+  try {
+    if (!env.CDP_URL) {
+      checks.cdp = { status: 'not_configured' };
       checks.status = 'degraded';
+    } else {
+      // Validate CDP URL format but DON'T expose protocol/host details
+      new URL(env.CDP_URL);
+      checks.cdp = { status: 'configured' };
     }
+  } catch {
+    checks.cdp = { status: 'invalid_url' };
+    checks.status = 'degraded';
   }
 
   return createJSONResponse(checks, checks.status === 'ok' ? 200 : 503, corsHeaders);

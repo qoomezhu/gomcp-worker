@@ -33,26 +33,36 @@ export class CDPClient {
     }
 
     return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(this.url);
+      const ws = new WebSocket(this.url);
+      this.ws = ws;
 
-      this.ws.onopen = () => {
+      const onOpen = () => {
         this.connected = true;
+        ws.removeEventListener('open', onOpen);
+        ws.removeEventListener('close', onClose);
+        ws.removeEventListener('error', onError);
+        ws.removeEventListener('message', onMessage);
         resolve();
       };
 
-      this.ws.onclose = () => {
+      const onClose = () => {
         this.connected = false;
         this.failPendingRequests(new Error('WebSocket closed'));
       };
 
-      this.ws.onerror = (error) => {
-        reject(new Error(`WebSocket error: ${String(error)}`));
+      const onError = (event: Event) => {
+        reject(new Error(`WebSocket error: ${String(event)}`));
       };
 
-      this.ws.onmessage = (event) => {
+      const onMessage = (event: MessageEvent) => {
         const data = typeof event.data === 'string' ? event.data : '';
         this.handleMessage(data);
       };
+
+      ws.addEventListener('open', onOpen);
+      ws.addEventListener('close', onClose);
+      ws.addEventListener('error', onError);
+      ws.addEventListener('message', onMessage);
     });
   }
 

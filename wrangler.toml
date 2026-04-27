@@ -1,6 +1,7 @@
 name = "gomcp-worker"
 main = "src/index.ts"
-compatibility_date = "2025-01-21"
+compatibility_date = "2025-04-28"
+compatibility_flags = ["nodejs_compat"]
 
 [[durable_objects.bindings]]
 name = "MCP_SESSION"
@@ -11,8 +12,15 @@ tag = "v1"
 new_sqlite_classes = ["MCPSession"]
 
 [vars]
+ALLOWED_ORIGINS = "*"
 
 [env.production]
+compatibility_flags = ["nodejs_compat"]
+
 [[env.production.durable_objects.bindings]]
 name = "MCP_SESSION"
 class_name = "MCPSession"
+
+[[env.production.migrations]]
+tag = "v1"
+new_sqlite_classes = ["MCPSession"]
