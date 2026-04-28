@@ -19,9 +19,20 @@ const SERVER_INFO = {
 const PROTOCOL_VERSION = '2025-03-26';
 const SESSION_STATE_KEY = 'session_state';
 
+// O(1) lookup map for tool resolution
 const TOOLS: MCPTool[] = [GotoTool, SearchTool, MarkdownTool, LinksTool];
-const EMPTY_RESOURCES = { resources: [] as Array<Record<string, never>> };
-const EMPTY_PROMPTS = { prompts: [] as Array<Record<string, never>> };
+const TOOLS_BY_NAME = new Map<string, MCPTool>(TOOLS.map(t => [t.name, t]));
+const EMPTY_RESOURCES = { resources: [] } as const;
+const EMPTY_PROMPTS = { prompts: [] } as const;
+
+// Reusable CDP Runtime.evaluate expressions — avoids reconstructing strings on every call
+const HTML_CLEANUP_EXPRESSION = `
+  (function () {
+    const clone = document.documentElement.cloneNode(true);
+    clone.querySelectorAll('script, style, noscript, iframe, svg, link, meta').forEach((el) => el.remove());
+    return clone.outerHTML;
+  })()
+`;
 
 type SessionStatus = 'uninitialized' | 'active' | 'closed';
 
@@ -195,7 +206,7 @@ export class MCPSession extends DurableObject {
       };
     }
 
-    const tool = TOOLS.find((candidate) => candidate.name === name);
+    const tool = TOOLS_BY_NAME.get(name);
     if (!tool) {
       return {
         jsonrpc: '2.0',
@@ -210,7 +221,7 @@ export class MCPSession extends DurableObject {
         content: [
           {
             type: 'text',
-            text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
+            text: typeof result === 'string' ? result : JSON.stringify(result),
           },
         ],
       };
@@ -317,13 +328,7 @@ export class MCPSession extends DurableObject {
     const cleanedHtml = await this.cdpClient.send<any>(
       'Runtime.evaluate',
       {
-        expression: `
-          (function () {
-            const clone = document.documentElement.cloneNode(true);
-            clone.querySelectorAll('script, style, noscript, iframe, svg, link, meta').forEach((el) => el.remove());
-            return clone.outerHTML;
-          })()
-        `,
+        expression: HTML_CLEANUP_EXPRESSION,
         returnByValue: true,
       },
       this.cdpSessionId
@@ -394,7 +399,7 @@ export class MCPSession extends DurableObject {
       return 'No search results found.';
     }
 
-    return JSON.stringify(data, null, 2);
+    return JSON.stringify(data);
   }
 
   public getPageState() {

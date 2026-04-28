@@ -4,7 +4,7 @@ type PendingRequest = {
   timeout: ReturnType<typeof setTimeout>;
 };
 
-type EventListener = {
+type CDPEventListener = {
   callback: (params: any, message: any) => void;
   once: boolean;
   sessionId?: string;
@@ -19,7 +19,7 @@ export class CDPClient {
   private ws: WebSocket | null = null;
   private readonly url: string;
   private readonly pendingRequests: Map<number, PendingRequest> = new Map();
-  private readonly eventListeners: Map<string, EventListener[]> = new Map();
+  private readonly eventListeners: Map<string, CDPEventListener[]> = new Map();
   private connected = false;
   private nextRequestId = 0;
 
@@ -36,12 +36,20 @@ export class CDPClient {
       const ws = new WebSocket(this.url);
       this.ws = ws;
 
-      const onOpen = () => {
-        this.connected = true;
+      let settled = false;
+
+      const cleanupAll = () => {
+        if (settled) return;
+        settled = true;
         ws.removeEventListener('open', onOpen);
         ws.removeEventListener('close', onClose);
         ws.removeEventListener('error', onError);
         ws.removeEventListener('message', onMessage);
+      };
+
+      const onOpen = () => {
+        this.connected = true;
+        cleanupAll();
         resolve();
       };
 
@@ -51,6 +59,7 @@ export class CDPClient {
       };
 
       const onError = (event: Event) => {
+        cleanupAll();
         reject(new Error(`WebSocket error: ${String(event)}`));
       };
 
@@ -148,7 +157,8 @@ export class CDPClient {
   }
 
   async send<T = any>(method: string, params: Record<string, any> = {}, sessionId?: string): Promise<T> {
-    if (!this.ws || !this.connected) {
+    const currentWs = this.ws;
+    if (!currentWs || !this.connected) {
       throw new Error('CDP not connected');
     }
 
@@ -174,7 +184,7 @@ export class CDPClient {
         payload.sessionId = sessionId;
       }
 
-      this.ws!.send(JSON.stringify(payload));
+      currentWs.send(JSON.stringify(payload));
     });
   }
 
@@ -240,7 +250,7 @@ export class CDPClient {
 
       if (typeof message?.method === 'string') {
         const listeners = this.eventListeners.get(message.method) ?? [];
-        const remaining: EventListener[] = [];
+        const remaining: CDPEventListener[] = [];
 
         for (const listener of listeners) {
           if (listener.sessionId && listener.sessionId !== message.sessionId) {

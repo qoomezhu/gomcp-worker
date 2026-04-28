@@ -30,24 +30,26 @@ function createErrorResponse(code: number, message: string, id: number | string 
 }
 
 function getAllowedOrigin(request: Request, env: Env): string {
-  const allowedOrigins = env.ALLOWED_ORIGINS?.trim();
-  if (!allowedOrigins || allowedOrigins === '*') {
+  const raw = env.ALLOWED_ORIGINS?.trim();
+  if (!raw || raw === '*') {
     return '*';
   }
 
+  // Cache the split once to avoid redundant computation
+  const allowedList = raw.split(',').map(o => o.trim());
+
   const origin = request.headers.get('Origin');
   if (!origin) {
-    // No Origin header  —  return the first allowed origin for non-browser clients
-    return allowedOrigins.split(',')[0].trim();
+    // No Origin header — return the first allowed origin for non-browser clients
+    return allowedList[0];
   }
 
-  const allowed = allowedOrigins.split(',').map(o => o.trim());
-  if (allowed.includes(origin)) {
+  if (allowedList.includes(origin)) {
     return origin;
   }
 
-  // Origin not in whitelist  —  return first allowed origin (browsers will block, non-browser clients don't care)
-  return allowed[0];
+  // Origin not in whitelist — return first allowed origin (browsers will block, non-browser clients don't care)
+  return allowedList[0];
 }
 
 function createCorsHeaders(request: Request, env: Env): Record<string, string> {
